@@ -38,7 +38,7 @@ class SedmDB:
             """
             Creates the connection to SedmDB.
             """
-            sedmdbcon = psycopg2.connect(host='localhost', port="5432", dbname=self.dbname,
+            sedmdbcon = psycopg2.connect(host='pharos.caltech.edu', port="5432", dbname=self.dbname,
                                          user=self.user_sedmdb)
             return sedmdbcon
 

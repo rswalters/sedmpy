@@ -16,7 +16,7 @@ from bokeh.models import CDSView, GroupFilter
 from bokeh.plotting import figure
 from bokeh.embed import components
 from astropy.time import Time
-from scheduler.scheduler import ScheduleNight
+from web.scheduler.scheduler import ScheduleNight
 
 superuser_list = ['rsw', 'SEDm_admin', 189, 2, 20180523190352189]
 db = SedmDB(host='pharos.caltech.edu', dbname='sedmdb')
@@ -50,8 +50,8 @@ request_form_values = ['request_id', 'object_id', 'marshal_id',
 
 rc_filter_list = ['r', 'g', 'i', 'u']
 schedule = ScheduleNight()
-#computer = 'pele'
-computer = 'pharos'
+computer = 'pele'
+#computer = 'pharos'
 
 if computer == 'pele':
     raw_dir = '/scr7/rsw/sedm/raw/'
@@ -841,6 +841,215 @@ def check_login(username, password):
     else:
         return False, 'Incorrect username or password!!'
 
+###############################################################################
+# THIS SECTION HANDLES ALL THINGS RELATED TO THE STATS PAGE.                  #
+# KEYWORD:STATS                                                               #
+###############################################################################
+def get_project_stats(content, user_id=""):
+    """
+    
+    :param content: 
+    :param user_id: 
+    :return: 
+    """
+
+    # Start by getting all the allocations for a user
+    if 'inidate' not in content:
+        inidate = None
+    else:
+        inidate = content['inidate']
+
+    if 'enddate' not in content:
+        enddate = None
+    else:
+        enddate = content['enddate']
+
+    data = get_allocation_stats(user_id, inidate=inidate, enddate=enddate)
+    plots = plot_stats_allocation(data)
+
+    script, div = components(plots)
+    return {'script': script, 'div': div}
+
+def get_allocation_stats(user_id, inidate=None, enddate=None):
+    """
+    Obtains a list of allocations that belong to the user and 
+    query the total allocated name and time spent for that allocation.
+
+    If no user_id is provided, all active allocations are returned.
+    """
+    if (user_id is None):
+        res = db.get_from_allocation(["designator", "time_allocated", "time_spent"], {"active":True})
+        df = pd.DataFrame(res, columns=["designator", "time_allocated", "time_spent"])
+
+        alloc_hours = np.array([ta.total_seconds() / 3600. for ta in df["time_allocated"]])
+        spent_hours = np.array([ts.total_seconds() / 3600. for ts in df["time_spent"]])
+        free_hours = alloc_hours - spent_hours
+
+        df = df.assign(alloc_hours=alloc_hours, spent_hours=spent_hours, free_hours=free_hours)
+
+    else:
+        if (inidate is None or enddate is None):
+            res = db.execute_sql(""" SELECT a.designator, a.time_allocated, a.time_spent
+                                    FROM allocation a, program p, groups g, usergroups ug
+                                    WHERE a.program_id = p.id AND p.group_id = g.id 
+                                    AND g.id = ug.group_id AND a.active is True AND ug.user_id = %d"""%(user_id))
+
+            df = pd.DataFrame(res, columns=["designator", "time_allocated", "time_spent"])
+
+            alloc_hours = np.array([ta.total_seconds() / 3600. for ta in df["time_allocated"]])
+            spent_hours = np.array([ts.total_seconds() / 3600. for ts in df["time_spent"]])
+            free_hours = alloc_hours - spent_hours
+
+            df = df.assign(alloc_hours=alloc_hours, spent_hours=spent_hours, free_hours=free_hours)
+
+
+        else:
+            res = db.execute_sql(""" SELECT DISTINCT a.id, a.designator, a.time_allocated
+                                    FROM allocation a, program p, groups g, usergroups ug
+                                    WHERE a.program_id = p.id AND p.group_id = g.id 
+                                    AND g.id = ug.group_id AND a.active is True AND ug.user_id = %d;"""%(user_id))
+            allocdes = []
+            spent_hours = []
+            alloc = []
+            for ais in res:
+                spent = db.get_allocation_spent_time(ais[0], inidate, enddate)
+                allocdes.append(ais[1])
+                spent_hours.append(int(spent)/3600.)
+                alloc.append(ais[2])
+            res = np.array([allocdes, alloc, spent_hours])
+
+            df = pd.DataFrame(res.T, columns=["designator", "time_allocated", "time_spent"])
+            alloc_hours = np.array([ta.total_seconds() / 3600. for ta in df["time_allocated"]])
+            free_hours = alloc_hours - spent_hours
+            df = df.assign(alloc_hours=alloc_hours, spent_hours=spent_hours, free_hours=free_hours)
+
+
+    df = df.sort_values(by=["alloc_hours"], ascending=False)
+
+    alloc_names = df["designator"].values
+    category = ["alloc_hours", "spent_hours", "free_hours"]
+
+
+    data = {'allocations' : alloc_names}
+
+    for cat in category:
+        data[cat] = df[cat]
+
+    return data
+
+
+def plot_stats_allocation(data):
+    """
+    Plots in the shape of bars the time available and spent for each active allocation.
+    """
+
+    # Create the first plot with the allocation hours
+    alloc_names = data['allocations']
+    categories = ["spent_hours", "free_hours"]
+    colors = ["#e84d60", "darkgreen"]  # "#c9d9d3"
+
+    N = len(alloc_names)
+
+    source = ColumnDataSource(data=data)
+    p = figure(x_range=alloc_names, plot_height=420, plot_width=80 * 8,
+               title="Time spent/available for SEDM allocations this term",
+               toolbar_location=None, tools="")
+
+    p.vbar_stack(categories, x='allocations', width=0.9, color=colors, source=source, legend=["Spent", "Available"])
+    p.y_range.start = 0
+    p.x_range.range_padding = 0.1
+    p.xgrid.grid_line_color = None
+    p.axis.minor_tick_line_color = None
+    p.outline_line_color = None
+    p.legend.location = "top_right"
+    p.legend.orientation = "horizontal"
+    p.yaxis.axis_label = 'Hours'
+    p.xaxis.major_label_orientation = 0.3
+
+    # Create the second plot with the % spent
+    alloc_names = data['allocations']
+    percentage = (data["spent_hours"] / data["alloc_hours"]) * 100
+
+    colors = N * ['#084594']
+    '''for i, p in enumerate(percentage):
+        if p<50: colors[i] = '#22A784'
+        elif p>50 and p<75: colors[i] = '#FD9F6C'
+        else: colors[i] = '#DD4968'''
+
+    source = ColumnDataSource(data=dict(alloc_names=alloc_names, percentage=percentage, color=colors))
+
+    p2 = figure(x_range=alloc_names, y_range=(0, 100), plot_height=420, plot_width=80 * 8,
+                title="Percentage of time spent",
+                toolbar_location=None, tools="")
+
+    p2.vbar(x='alloc_names', top='percentage', width=0.9, color='color', source=source)
+
+    p2.xgrid.grid_line_color = None
+    p2.legend.orientation = "horizontal"
+    p2.legend.location = "top_center"
+    p2.yaxis.axis_label = '% time spent'
+    p2.xaxis.major_label_orientation = 0.3
+
+    # Create the pie charts
+    pieColors = 10 * ["red", "green", "blue", "orange", "yellow", 'lime', 'brown', 'cyan',
+                      'magenta', 'olive', 'black', 'teal', 'gold', 'crimson', 'moccasin', 'greenyellow', 'navy',
+                      'ivory', 'lightpink']
+
+    # First one with the time spent
+
+    # define starts/ends for wedges from percentages of a circle
+    percents_only = np.round(np.array(list(data["spent_hours"] / np.sum(data["spent_hours"]))) * 100, 1)
+    percents = np.cumsum([0] + list(data["spent_hours"] / np.sum(data["spent_hours"])))
+    starts = [per * 2 * np.pi for per in percents[:-1]]
+    ends = [per * 2 * np.pi for per in percents[1:]]
+
+    p3 = figure(x_range=(-1, 2.5), y_range=(-1.1, 1.1), plot_height=420, plot_width=600, title="% spent")
+
+    # Add individual wedges:
+    for i in range(N):
+        p3.wedge(x=0, y=0, radius=.9, start_angle=starts[i], end_angle=ends[i], color=pieColors[i],
+                 legend="[{0}%] {1}".format(percents_only[i], alloc_names[i]))
+
+    p3.xgrid.grid_line_color = None
+    p3.ygrid.grid_line_color = None
+    p3.legend.orientation = "vertical"
+    p3.legend.location = "top_right"
+    p3.legend.border_line_alpha = 0
+    p3.legend.background_fill_color = None
+    p3.xaxis.visible = False
+    p3.yaxis.visible = False
+
+    # Second one with the time allocated
+
+    # define starts/ends for wedges from percentages of a circle
+    percents_only = np.round(np.array(list(data["alloc_hours"] / np.sum(data["alloc_hours"]))) * 100, 1)
+    percents = np.cumsum([0] + list(data["alloc_hours"] / np.sum(data["alloc_hours"])))
+    starts = [per * 2 * np.pi for per in percents[:-1]]
+    ends = [per * 2 * np.pi for per in percents[1:]]
+
+    p4 = figure(x_range=(-1, 2.5), y_range=(-1.1, 1.1), plot_height=420, plot_width=600,
+                title="% time allocated to each program")
+    # Add individual wedges:
+    for i in range(N):
+        p4.wedge(x=0, y=0, radius=.9, start_angle=starts[i], end_angle=ends[i], color=pieColors[i],
+                 legend="[{0}%] {1}".format(percents_only[i], alloc_names[i]))
+
+    p4.xgrid.grid_line_color = None
+    p4.ygrid.grid_line_color = None
+    p4.legend.orientation = "vertical"
+    p4.legend.location = "top_right"
+    p4.legend.border_line_alpha = 0
+    p4.legend.background_fill_color = None
+    p4.xaxis.visible = False
+    p4.yaxis.visible = False
+
+    layout = row(column(p, p2), column(p4, p3))
+
+    curdoc().add_root(layout)
+    curdoc().title = "Allocation stats"
+
+    return layout
+
 
 ###############################################################################
 # THIS SECTION HANDLES ALL THINGS RELATED TO THE VIEW_DATA PAGE.              #
@@ -1282,119 +1491,6 @@ def plot_not_found_message(day):
     layout = column(not_found)
     curdoc().add_root(layout)
     curdoc().title = "Stats not found"
-
-
-def plot_stats_allocation(data):
-    """
-    Plots in the shape of bars the time available and spent for each active allocation.
-    """
-
-    # Create the first plot with the allocation hours
-    alloc_names = data['allocations']
-    categories = ["spent_hours", "free_hours"]
-    colors = ["#e84d60", "darkgreen"]  # "#c9d9d3"
-
-    N = len(alloc_names)
-
-    source = ColumnDataSource(data=data)
-    p = figure(x_range=alloc_names, plot_height=420, plot_width=80 * 8,
-               title="Time spent/available for SEDM allocations this term",
-               toolbar_location=None, tools="")
-
-    p.vbar_stack(categories, x='allocations', width=0.9, color=colors, source=source, legend=["Spent", "Available"])
-    p.y_range.start = 0
-    p.x_range.range_padding = 0.1
-    p.xgrid.grid_line_color = None
-    p.axis.minor_tick_line_color = None
-    p.outline_line_color = None
-    p.legend.location = "top_right"
-    p.legend.orientation = "horizontal"
-    p.yaxis.axis_label = 'Hours'
-    p.xaxis.major_label_orientation = 0.3
-
-    # Create the second plot with the % spent
-    alloc_names = data['allocations']
-    percentage = (data["spent_hours"] / data["alloc_hours"]) * 100
-
-    colors = N * ['#084594']
-    '''for i, p in enumerate(percentage):
-        if p<50: colors[i] = '#22A784'
-        elif p>50 and p<75: colors[i] = '#FD9F6C'
-        else: colors[i] = '#DD4968'''
-
-    source = ColumnDataSource(data=dict(alloc_names=alloc_names, percentage=percentage, color=colors))
-
-    p2 = figure(x_range=alloc_names, y_range=(0, 100), plot_height=420, plot_width=80 * 8,
-                title="Percentage of time spent",
-                toolbar_location=None, tools="")
-
-    p2.vbar(x='alloc_names', top='percentage', width=0.9, color='color', source=source)
-
-    p2.xgrid.grid_line_color = None
-    p2.legend.orientation = "horizontal"
-    p2.legend.location = "top_center"
-    p2.yaxis.axis_label = '% time spent'
-    p2.xaxis.major_label_orientation = 0.3
-
-    # Create the pie charts
-    pieColors = 10 * ["red", "green", "blue", "orange", "yellow", 'lime', 'brown', 'cyan',
-                      'magenta', 'olive', 'black', 'teal', 'gold', 'crimson', 'moccasin', 'greenyellow', 'navy',
-                      'ivory', 'lightpink']
-
-    # First one with the time spent
-
-    # define starts/ends for wedges from percentages of a circle
-    percents_only = np.round(np.array(list(data["spent_hours"] / np.sum(data["spent_hours"]))) * 100, 1)
-    percents = np.cumsum([0] + list(data["spent_hours"] / np.sum(data["spent_hours"])))
-    starts = [per * 2 * np.pi for per in percents[:-1]]
-    ends = [per * 2 * np.pi for per in percents[1:]]
-
-    p3 = figure(x_range=(-1, 2.5), y_range=(-1.1, 1.1), plot_height=420, plot_width=600, title="% spent")
-
-    # Add individual wedges:
-    for i in range(N):
-        p3.wedge(x=0, y=0, radius=.9, start_angle=starts[i], end_angle=ends[i], color=pieColors[i],
-                 legend="[{0}%] {1}".format(percents_only[i], alloc_names[i]))
-
-    p3.xgrid.grid_line_color = None
-    p3.ygrid.grid_line_color = None
-    p3.legend.orientation = "vertical"
-    p3.legend.location = "top_right"
-    p3.legend.border_line_alpha = 0
-    p3.legend.background_fill_color = None
-    p3.xaxis.visible = False
-    p3.yaxis.visible = False
-
-    # Second one with the time allocated
-
-    # define starts/ends for wedges from percentages of a circle
-    percents_only = np.round(np.array(list(data["alloc_hours"] / np.sum(data["alloc_hours"]))) * 100, 1)
-    percents = np.cumsum([0] + list(data["alloc_hours"] / np.sum(data["alloc_hours"])))
-    starts = [per * 2 * np.pi for per in percents[:-1]]
-    ends = [per * 2 * np.pi for per in percents[1:]]
-
-    p4 = figure(x_range=(-1, 2.5), y_range=(-1.1, 1.1), plot_height=420, plot_width=600,
-                title="% time allocated to each program")
-    # Add individual wedges:
-    for i in range(N):
-        p4.wedge(x=0, y=0, radius=.9, start_angle=starts[i], end_angle=ends[i], color=pieColors[i],
-                 legend="[{0}%] {1}".format(percents_only[i], alloc_names[i]))
-
-    p4.xgrid.grid_line_color = None
-    p4.ygrid.grid_line_color = None
-    p4.legend.orientation = "vertical"
-    p4.legend.location = "top_right"
-    p4.legend.border_line_alpha = 0
-    p4.legend.background_fill_color = None
-    p4.xaxis.visible = False
-    p4.yaxis.visible = False
-
-    layout = row(column(p, p2), column(p4, p3))
-
-    curdoc().add_root(layout)
-    curdoc().title = "Allocation stats"
-
-    return layout
 
 
 ###############################################################################
